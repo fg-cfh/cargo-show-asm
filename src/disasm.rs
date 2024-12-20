@@ -183,6 +183,8 @@ fn dump_slices(
         BTreeMap::new()
     };
 
+    // ARM: Bit zero designates the instruction set.
+    let addr = addr & !1;
     let start = addr - section.address() as usize;
     let cs = make_capstone(file, syntax)?;
     let code = &section.data()?[start..start + len];
@@ -334,6 +336,273 @@ impl From<OutputStyle> for capstone::Syntax {
     }
 }
 
+fn arm_instruction_set(file: &object::File) -> anyhow::Result<capstone::arch::arm::ArchMode> {
+    use capstone::arch::arm::ArchMode;
+    use object::{
+        elf,
+        read::elf::{
+            AttributeReader, AttributesSection, AttributesSubsection, AttributesSubsectionIterator,
+            AttributesSubsubsection, AttributesSubsubsectionIterator, SectionHeader,
+        },
+        Endianness,
+    };
+
+    // Public ARM build attributes ordered by their tag value, see ADDENDA32,
+    // sections 3.3.5-3.3.7 and 3.5.
+    #[repr(u8)]
+    #[allow(dead_code)]
+    enum AeabiTag {
+        CpuRawName = 4,
+        CpuName,
+        CpuArch,
+        CpuArchProfile,
+        ArmIsaUse,
+        ThumbIsaUse,
+        FpArch,
+        WmmxArch,
+        AdvancedSimdArch,
+        PcsConfig,
+        AbiPcsR9Use,
+        AbiPcsRwData,
+        AbiPcsRoData,
+        AbiPcsGotUse,
+        AbiPcsWcharT,
+        AbiFpRounding,
+        AbiFpDenormal,
+        AbiFpExceptions,
+        AbiFpUserExceptions,
+        AbiFpNumberModel,
+        AbiAlignNeeded,
+        AbiAlignPreserved,
+        AbiEnumSize,
+        AbiHardFpUse,
+        AbiVfpArgs,
+        AbiWmmxArgs,
+        AbiOptimizationGoals,
+        AbiFpOptimizationGoals,
+        Compatibility,
+        CpuUnalignedAccess = 34,
+        FpHpExtension = 36,
+        AbiFp16BitFormat = 38,
+        MpExtensionUse = 42,
+        DivUse = 44,
+        DspExtension = 46,
+        MveArch = 48,
+        PacExtension = 50,
+        BtiExtension = 52,
+        NoDefaults = 64,
+        AlsoCompatibleWith,
+        T2eeUse,
+        Conformance,
+        VirtualizationUse,
+        FramePointerUse = 72,
+        BtiUse = 74,
+        PacretUse = 76,
+    }
+
+    enum AeabiTagEncoding {
+        // unsigned little endian base 128
+        ULeb128,
+        // null terminated byte string
+        Ntbs,
+    }
+
+    impl AeabiTag {
+        fn encoding(&self) -> AeabiTagEncoding {
+            match self {
+                Self::CpuRawName
+                | Self::CpuName
+                | Self::Compatibility
+                | Self::AlsoCompatibleWith
+                | Self::Conformance => AeabiTagEncoding::Ntbs,
+                _ => AeabiTagEncoding::ULeb128,
+            }
+        }
+    }
+
+    impl TryFrom<u64> for AeabiTag {
+        type Error = anyhow::Error;
+
+        fn try_from(discriminant: u64) -> Result<Self, Self::Error> {
+            const R1MIN: u64 = AeabiTag::CpuRawName as u64;
+            const R1MAX: u64 = AeabiTag::Compatibility as u64;
+            const R2: u64 = AeabiTag::CpuUnalignedAccess as u64;
+            const R3: u64 = AeabiTag::FpHpExtension as u64;
+            const R4: u64 = AeabiTag::AbiFp16BitFormat as u64;
+            const R5: u64 = AeabiTag::MpExtensionUse as u64;
+            const R6: u64 = AeabiTag::DivUse as u64;
+            const R7: u64 = AeabiTag::DspExtension as u64;
+            const R8: u64 = AeabiTag::MveArch as u64;
+            const R9: u64 = AeabiTag::PacExtension as u64;
+            const R10: u64 = AeabiTag::BtiExtension as u64;
+            const R11MIN: u64 = AeabiTag::NoDefaults as u64;
+            const R11MAX: u64 = AeabiTag::VirtualizationUse as u64;
+            const R12: u64 = AeabiTag::FramePointerUse as u64;
+            const R13: u64 = AeabiTag::BtiUse as u64;
+            const R14: u64 = AeabiTag::PacretUse as u64;
+
+            if let R1MIN..R1MAX
+            | R2
+            | R3
+            | R4
+            | R5
+            | R6
+            | R7
+            | R8
+            | R9
+            | R10
+            | R11MIN..R11MAX
+            | R12
+            | R13
+            | R14 = discriminant
+            {
+                Ok(unsafe {
+                    // SAFETY: We checked that the discriminant is in
+                    // range. Also, field-less enums inherit alignment
+                    // and size from the primitive type (see Rust
+                    // Reference, Type Layout, Primitive
+                    // representations).
+                    std::mem::transmute::<u8, AeabiTag>(discriminant.try_into().unwrap())
+                })
+            } else {
+                anyhow::bail!("invalid ARM build attribute tag")
+            }
+        }
+    }
+
+    fn from_att_subsect_to_arm_build_att_sect_iter(
+        maybe_att_subsect: Result<
+            AttributesSubsection<elf::FileHeader32<Endianness>>,
+            object::Error,
+        >,
+    ) -> Option<AttributesSubsubsectionIterator<elf::FileHeader32<Endianness>>> {
+        match maybe_att_subsect {
+            Ok(att_subsect) => {
+                // We're only interested in ARM public
+                // attributes sub-sections (see ADDENDA32,
+                // sections 3.2.4 and 3.3)
+                if let b"aeabi" = att_subsect.vendor() {
+                    Some(att_subsect.subsubsections())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn from_arm_build_att_sect_to_attribute_reader(
+        maybe_att_subsubsect: Result<AttributesSubsubsection, object::Error>,
+    ) -> Option<AttributeReader> {
+        match maybe_att_subsubsect {
+            Ok(att_subsubsect) => {
+                // Recent ARM object files should only
+                // contain a file-related public build
+                // attributes sub-subsection (see "Note" in
+                // ADDENDA32, section 3.3.3).  To keep it
+                // simple, we ignore deprecated Section and
+                // Symbol attribute sub-sub-sections.
+                if att_subsubsect.tag() == object::elf::Tag_File {
+                    Some(att_subsubsect.attributes())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn from_att_reader_to_arm_arch_mode(
+        mut att_reader: AttributeReader,
+    ) -> Result<ArchMode, anyhow::Error> {
+        let mut uses_arm = false;
+        let mut uses_thumb = false;
+        while let Ok(Some(tag_value)) = att_reader.read_tag() {
+            match AeabiTag::try_from(tag_value)? {
+                AeabiTag::ArmIsaUse => {
+                    if att_reader.read_integer().is_ok_and(|val| val > 0) {
+                        uses_arm = true;
+                    }
+                }
+                AeabiTag::ThumbIsaUse => {
+                    if att_reader.read_integer().is_ok_and(|val| val > 0) {
+                        uses_thumb = true;
+                    }
+                }
+                other => match other.encoding() {
+                    // Ignore the tag value.
+                    AeabiTagEncoding::Ntbs => {
+                        let _ = att_reader.read_string();
+                    }
+                    AeabiTagEncoding::ULeb128 => {
+                        let _ = att_reader.read_integer();
+                    }
+                },
+            };
+        }
+        match (uses_arm, uses_thumb) {
+            (true, false) => Ok(ArchMode::Arm),
+            (false, true) => Ok(ArchMode::Thumb),
+            _ => anyhow::bail!("invalid ARM encoding"),
+        }
+    }
+
+    fn arm_att_sect<'data>(
+        (endian, data, header): (Endianness, &'data [u8], &elf::SectionHeader32<Endianness>),
+    ) -> Option<AttributesSection<'data, elf::FileHeader32<Endianness>>> {
+        // see ADDENDA32, section 3.2.1
+        if header.sh_type(endian) == elf::SHT_ARM_ATTRIBUTES {
+            Some(header.attributes(endian, data).unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn to_version_a_att_subsect(
+        att_sect: AttributesSection<elf::FileHeader32<Endianness>>,
+    ) -> Option<AttributesSubsectionIterator<elf::FileHeader32<Endianness>>> {
+        // see ADDENDA32, section 3.2.3
+        if att_sect.version() == b'A' {
+            att_sect.subsections().ok()
+        } else {
+            None
+        }
+    }
+
+    fn to_arm_arch_mode(
+        att_subsect_iter: AttributesSubsectionIterator<elf::FileHeader32<Endianness>>,
+    ) -> Result<ArchMode, anyhow::Error> {
+        att_subsect_iter
+            .filter_map(from_att_subsect_to_arm_build_att_sect_iter)
+            .flatten()
+            .filter_map(from_arm_build_att_sect_to_attribute_reader)
+            .map(from_att_reader_to_arm_arch_mode)
+            .reduce(|_, _| anyhow::bail!("non-unique ARM build attribute section"))
+            .unwrap_or(Err(anyhow::anyhow!("invalid ARM build attribute section")))
+    }
+
+    match &file {
+        // We need ARM ELF-specific meta-data ("ARM build attributes")
+        // to identify the instruction set (Arm aka "a32" vs. Thumb aka
+        // "t32") applicable to a given file, see ARM Arch ABI, 2024Q3,
+        // Addenda (ADDENDA32), section 3.
+        object::File::Elf32(elf_file) => elf_file
+            .sections()
+            .map(|section| {
+                (
+                    file.endianness(),
+                    section.elf_file().data(),
+                    section.elf_section_header(),
+                )
+            })
+            .find_map(arm_att_sect)
+            .and_then(to_version_a_att_subsect)
+            .map(to_arm_arch_mode)
+            .unwrap_or(Err(anyhow::anyhow!("no ARM build attribute section"))),
+        _ => Err(anyhow::anyhow!("expected ARM32 file")),
+    }
+}
+
 fn make_capstone(file: &object::File, syntax: OutputStyle) -> anyhow::Result<Capstone> {
     use capstone::{
         arch::{self, BuildsCapstone},
@@ -352,6 +621,13 @@ fn make_capstone(file: &object::File, syntax: OutputStyle) -> anyhow::Result<Cap
 
     let mut capstone = match file.architecture() {
         Architecture::Aarch64 => Capstone::new().arm64().build()?,
+        Architecture::Arm => {
+            let mode = match arm_instruction_set(file) {
+                Ok(mode) => mode,
+                Err(e) => return Err(e),
+            };
+            Capstone::new().arm().mode(mode).build()?
+        }
         Architecture::X86_64 => Capstone::new().x86().mode(x86_width).build()?,
         unknown => anyhow::bail!("Dunno how to decompile {unknown:?}"),
     };
